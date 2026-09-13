@@ -103,14 +103,12 @@ def main():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-
     application.add_handler(
-        MessageHandler(
-            filters.VIDEO | filters.Document.VIDEO,
-            handle_message
-        )
+    MessageHandler(
+        filters.ALL,
+        handle_message
     )
+)
 
     print("🚀 H3LIUM Lecture Bot starting...")
     print("Webhook URL:", f"{BASE_URL}/{WEBHOOK_PATH}")
