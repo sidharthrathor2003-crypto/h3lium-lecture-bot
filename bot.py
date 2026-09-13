@@ -1,4 +1,5 @@
 import os
+import subprocess
 
 from telegram import Update
 from telegram.constants import ChatType
@@ -20,12 +21,66 @@ WEBHOOK_PATH = "telegram-webhook"
 STORAGE_CHANNEL_ID = os.environ.get("STORAGE_CHANNEL_ID")
 
 
+# =========================
+# START COMMAND
+# =========================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 H3LIUM Lecture Bot\n\n"
-        "Lecture/video bhejo. Main ise H3LIUM storage system ke liye process karunga."
+        "Lecture/video bhejo. Main ise H3LIUM Storage Channel mein save karunga."
     )
 
+
+# =========================
+# FFMPEG TEST COMMAND
+# =========================
+
+async def check_ffmpeg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode == 0:
+            first_line = (
+                result.stdout.splitlines()[0]
+                if result.stdout
+                else "FFmpeg found"
+            )
+
+            await update.message.reply_text(
+                "✅ FFmpeg AVAILABLE\n\n"
+                f"{first_line}\n\n"
+                "HLS processing ke next step par ja sakte hain."
+            )
+
+        else:
+            await update.message.reply_text(
+                "❌ FFmpeg command mila, lekin run nahi hua.\n\n"
+                f"Error:\n{result.stderr[:1000]}"
+            )
+
+    except FileNotFoundError:
+        await update.message.reply_text(
+            "❌ FFmpeg AVAILABLE NAHI HAI.\n\n"
+            "Render Free environment mein FFmpeg installed nahi hai."
+        )
+
+    except Exception as e:
+        print("FFmpeg check error:", repr(e))
+
+        await update.message.reply_text(
+            f"⚠️ FFmpeg check error:\n\n{repr(e)}"
+        )
+
+
+# =========================
+# MESSAGE HANDLER
+# =========================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -34,16 +89,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not chat:
         return
 
-    # Storage channel ka ID automatically dikhana
+    # =========================
+    # STORAGE CHANNEL DETECTION
+    # =========================
+
     if chat.type == ChatType.CHANNEL:
         if not STORAGE_CHANNEL_ID:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=f"✅ H3LIUM Storage Channel ID:\n\n{chat.id}"
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=f"✅ H3LIUM Storage Channel ID:\n\n{chat.id}"
+                )
+            except Exception as e:
+                print("Channel ID message error:", repr(e))
+
         return
 
-    # Sirf video ya video-file handle karna
+    # =========================
+    # VIDEO DETECTION
+    # =========================
+
     is_video = bool(message.video)
 
     is_video_document = bool(
@@ -58,19 +123,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Storage channel configured nahi hai
+    # =========================
+    # STORAGE CHANNEL CHECK
+    # =========================
+
     if not STORAGE_CHANNEL_ID:
         await message.reply_text(
             "⚠️ Storage channel abhi configure nahi hua.\n\n"
-            "Pehle H3LIUM storage channel connect karna hoga."
+            "Pehle H3LIUM Storage Channel connect karna hoga."
         )
         return
+
+    # =========================
+    # COPY VIDEO TO TELEGRAM STORAGE
+    # =========================
 
     try:
         storage_id = int(STORAGE_CHANNEL_ID)
 
         # Telegram ke andar hi message copy hoga.
-        # Video ko server par download nahi karna padega.
+        # Video Render server par download nahi hoga.
+
         await context.bot.copy_message(
             chat_id=storage_id,
             from_chat_id=chat.id,
@@ -91,7 +164,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# =========================
+# MAIN
+# =========================
+
 def main():
+
     if not BASE_URL:
         raise RuntimeError(
             "RENDER_EXTERNAL_URL environment variable nahi mila."
@@ -103,15 +181,29 @@ def main():
         .build()
     )
 
+    # /start
     application.add_handler(
-    MessageHandler(
-        filters.ALL,
-        handle_message
+        CommandHandler("start", start)
     )
-)
+
+    # /ffmpeg
+    application.add_handler(
+        CommandHandler("ffmpeg", check_ffmpeg)
+    )
+
+    # All other messages
+    application.add_handler(
+        MessageHandler(
+            filters.ALL,
+            handle_message
+        )
+    )
 
     print("🚀 H3LIUM Lecture Bot starting...")
-    print("Webhook URL:", f"{BASE_URL}/{WEBHOOK_PATH}")
+    print(
+        "Webhook URL:",
+        f"{BASE_URL}/{WEBHOOK_PATH}"
+    )
 
     application.run_webhook(
         listen="0.0.0.0",
@@ -121,6 +213,10 @@ def main():
         drop_pending_updates=True,
     )
 
+
+# =========================
+# RUN
+# =========================
 
 if __name__ == "__main__":
     main()
