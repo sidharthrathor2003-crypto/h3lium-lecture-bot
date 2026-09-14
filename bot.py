@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import shutil
 import asyncio
+import math
 import re
 
 from telegram import Update
@@ -19,12 +20,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from starlette.applications import Starlette
-from starlette.responses import (
-    JSONResponse,
-    PlainTextResponse,
-    StreamingResponse,
-    Response,
-)
+from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse, Response
 from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
@@ -36,35 +32,18 @@ import uvicorn
 # ENVIRONMENT
 # ============================================================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-PORT = int(os.environ.get("PORT", "10000"))
-
-BASE_URL = os.environ.get(
-    "RENDER_EXTERNAL_URL",
-    ""
-).rstrip("/")
-
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "telegram-webhook"
 
 STORAGE_CHANNEL_ID = int(
-    os.environ.get(
-        "STORAGE_CHANNEL_ID",
-        "-1004492199475"
-    )
+    os.getenv("STORAGE_CHANNEL_ID", "-1004492199475")
 )
 
-TELEGRAM_API_ID = int(
-    os.environ.get(
-        "TELEGRAM_API_ID",
-        "0"
-    )
-)
-
-TELEGRAM_API_HASH = os.environ.get(
-    "TELEGRAM_API_HASH",
-    ""
-)
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 
 
 # ============================================================
@@ -72,557 +51,484 @@ TELEGRAM_API_HASH = os.environ.get(
 # ============================================================
 
 LAST_STORAGE_MESSAGE_ID = None
-
 LAST_VIDEO_NAME = "lecture.mp4"
-
 PROCESSING = False
 
 telethon_client = None
 
+
+# ============================================================
+# HLS STORAGE
+# ============================================================
+
+# Every Telegram storage message gets its own HLS folder:
+#
+# /tmp/h3lium_hls/11/index.m3u8
+# /tmp/h3lium_hls/12/index.m3u8
+# /tmp/h3lium_hls/13/index.m3u8
+#
+# This prevents a new lecture from replacing the previous
+# lecture's HLS output while the Render instance is running.
+
 HLS_BASE_DIR = "/tmp/h3lium_hls"
+
+os.makedirs(HLS_BASE_DIR, exist_ok=True)
+
+
+def safe_message_id(value):
+    """Return a valid positive Telegram message ID or None."""
+    try:
+        message_id = int(value)
+        if message_id <= 0:
+            return None
+        return message_id
+    except (TypeError, ValueError):
+        return None
+
+
+def hls_dir_for_message(message_id):
+    """Return the HLS directory for one Telegram storage message."""
+    message_id = safe_message_id(message_id)
+    if message_id is None:
+        raise ValueError("Invalid message ID")
+
+    path = os.path.join(HLS_BASE_DIR, str(message_id))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def hls_playlist_path(message_id):
+    return os.path.join(hls_dir_for_message(message_id), "index.m3u8")
 
 
 # ============================================================
-# TELETHON START
+# TELETHON
 # ============================================================
 
 async def start_telethon():
-
     global telethon_client
 
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
         raise RuntimeError(
-            "TELEGRAM_API_ID / TELEGRAM_API_HASH missing."
+            "TELEGRAM_API_ID / TELEGRAM_API_HASH environment variables missing."
         )
 
     telethon_client = TelegramClient(
         StringSession(),
-        TELEGRAM_API_ID,
-        TELEGRAM_API_HASH
+        int(TELEGRAM_API_ID),
+        TELEGRAM_API_HASH,
     )
 
-    await telethon_client.start(
-        bot_token=BOT_TOKEN
-    )
+    await telethon_client.start(bot_token=BOT_TOKEN)
 
     me = await telethon_client.get_me()
 
     print(
-        "✅ Telethon connected:",
-        getattr(me, "username", None)
-        or getattr(me, "first_name", None)
+        f"Telethon connected: @{getattr(me, 'username', None)} "
+        f"id={getattr(me, 'id', None)}"
     )
 
 
 # ============================================================
-# TELEGRAM STORAGE HELPERS
+# STORAGE VIDEO HELPERS
 # ============================================================
 
 def is_telethon_video(message):
-
     if not message:
         return False
 
     if getattr(message, "video", None):
         return True
 
-    document = getattr(
-        message,
-        "document",
-        None
-    )
+    document = getattr(message, "document", None)
 
-    if not document:
-        return False
+    if document:
+        mime_type = getattr(document, "mime_type", "") or ""
 
-    mime_type = getattr(
-        document,
-        "mime_type",
-        ""
-    ) or ""
+        if mime_type.startswith("video/"):
+            return True
 
-    if mime_type.startswith("video/"):
-        return True
+        for attr in getattr(document, "attributes", []) or []:
+            file_name = getattr(attr, "file_name", None)
 
-    filename = ""
+            if file_name:
+                lower = file_name.lower()
 
-    try:
-        for attr in getattr(
-            document,
-            "attributes",
-            []
-        ):
-            if hasattr(attr, "file_name"):
-                filename = attr.file_name or ""
-                break
-    except Exception:
-        pass
+                if lower.endswith(
+                    (
+                        ".mp4",
+                        ".mkv",
+                        ".mov",
+                        ".avi",
+                        ".webm",
+                        ".m4v",
+                        ".ts",
+                    )
+                ):
+                    return True
 
-    return filename.lower().endswith(
-        (
-            ".mp4",
-            ".mkv",
-            ".mov",
-            ".avi",
-            ".webm",
-            ".m4v",
-            ".ts"
-        )
-    )
-
-
-async def get_storage_video(
-    message_id=None
-):
-
-    global LAST_STORAGE_MESSAGE_ID
-
-    if not telethon_client:
-        raise RuntimeError(
-            "Telethon connected nahi hai."
-        )
-
-    # --------------------------------------------------------
-    # 1. EXACT MESSAGE ID
-    # --------------------------------------------------------
-
-    if message_id is not None:
-
-        try:
-
-            msg = await telethon_client.get_messages(
-                STORAGE_CHANNEL_ID,
-                ids=int(message_id)
-            )
-
-            if msg and is_telethon_video(msg):
-                return msg
-
-            raise RuntimeError(
-                f"Storage Channel message ID {message_id} "
-                f"video nahi hai."
-            )
-
-        except Exception as e:
-
-            print(
-                "Exact storage message error:",
-                repr(e)
-            )
-
-            raise
-
-
-    # --------------------------------------------------------
-    # 2. LAST KNOWN MESSAGE ID
-    # --------------------------------------------------------
-
-    if LAST_STORAGE_MESSAGE_ID:
-
-        try:
-
-            msg = await telethon_client.get_messages(
-                STORAGE_CHANNEL_ID,
-                ids=LAST_STORAGE_MESSAGE_ID
-            )
-
-            if msg and is_telethon_video(msg):
-                return msg
-
-        except Exception as e:
-
-            print(
-                "Last storage message lookup error:",
-                repr(e)
-            )
-
-
-    # --------------------------------------------------------
-    # 3. SCAN LATEST 100 MESSAGES
-    # --------------------------------------------------------
-
-    print(
-        "Scanning Storage Channel for latest video..."
-    )
-
-    async for msg in telethon_client.iter_messages(
-        STORAGE_CHANNEL_ID,
-        limit=100
-    ):
-
-        if is_telethon_video(msg):
-
-            LAST_STORAGE_MESSAGE_ID = msg.id
-
-            print(
-                "Latest storage video found:",
-                msg.id
-            )
-
-            return msg
-
-    raise RuntimeError(
-        "Storage Channel mein koi video nahi mila."
-    )
+    return False
 
 
 def get_message_file_info(message):
+    file_obj = getattr(message, "file", None)
 
-    size = None
-    mime_type = None
-    filename = "lecture.mp4"
+    size = getattr(file_obj, "size", None) if file_obj else None
+    mime_type = getattr(file_obj, "mime_type", None) if file_obj else None
+    name = getattr(file_obj, "name", None) if file_obj else None
 
-    document = getattr(
-        message,
-        "document",
-        None
-    )
-
-    video = getattr(
-        message,
-        "video",
-        None
-    )
-
-    if document:
-
-        size = getattr(
-            document,
-            "size",
-            None
-        )
-
-        mime_type = getattr(
-            document,
-            "mime_type",
-            None
-        )
-
-        try:
-
-            for attr in getattr(
-                document,
-                "attributes",
-                []
-            ):
-
-                if hasattr(attr, "file_name"):
-
-                    filename = (
-                        attr.file_name
-                        or filename
-                    )
-
-                    break
-
-        except Exception:
-            pass
-
-    elif video:
-
-        size = getattr(
-            video,
-            "size",
-            None
-        )
-
-        mime_type = getattr(
-            video,
-            "mime_type",
-            None
-        )
-
-        filename = (
-            getattr(
-                video,
-                "file_name",
-                None
-            )
-            or filename
-        )
+    if not name:
+        name = "lecture.mp4"
 
     return {
         "size": size,
         "mime_type": mime_type,
-        "filename": filename
+        "name": name,
     }
 
 
+async def get_storage_video(message_id=None):
+    """
+    Find a specific storage message when message_id is supplied.
+    Otherwise fall back to LAST_STORAGE_MESSAGE_ID and then scan
+    recent storage-channel messages for a video.
+    """
+
+    if telethon_client is None:
+        raise RuntimeError("Telethon is not connected.")
+
+    requested_id = safe_message_id(message_id)
+
+    # 1. Exact requested message ID
+    if requested_id is not None:
+        try:
+            message = await telethon_client.get_messages(
+                STORAGE_CHANNEL_ID,
+                ids=requested_id,
+            )
+
+            if message and is_telethon_video(message):
+                return message
+
+            raise RuntimeError(
+                f"Storage message ID {requested_id} was not found "
+                "or it is not a video."
+            )
+
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not retrieve storage message {requested_id}: {e}"
+            )
+
+    # 2. Last known storage message ID
+    last_id = safe_message_id(LAST_STORAGE_MESSAGE_ID)
+
+    if last_id is not None:
+        try:
+            message = await telethon_client.get_messages(
+                STORAGE_CHANNEL_ID,
+                ids=last_id,
+            )
+
+            if message and is_telethon_video(message):
+                return message
+        except Exception:
+            pass
+
+    # 3. Fallback: scan recent messages
+    async for message in telethon_client.iter_messages(
+        STORAGE_CHANNEL_ID,
+        limit=100,
+    ):
+        if is_telethon_video(message):
+            return message
+
+    raise RuntimeError("No video found in the storage channel.")
+
+
 # ============================================================
-# RANGE HEADER
+# RANGE STREAMING FROM TELEGRAM
 # ============================================================
 
-def parse_range_header(
-    range_header,
-    file_size
-):
-
+def parse_range_header(range_header, file_size):
     if not range_header:
         return None
 
     if not range_header.startswith("bytes="):
         return None
 
-    value = range_header.replace(
-        "bytes=",
-        "",
-        1
-    ).strip()
+    value = range_header.replace("bytes=", "", 1).strip()
 
+    # Only support a single range.
     if "," in value:
-        return None
+        value = value.split(",", 1)[0].strip()
 
-    match = re.match(
-        r"(\d*)-(\d*)",
-        value
-    )
+    match = re.match(r"^(\d*)-(\d*)$", value)
 
     if not match:
         return None
 
-    start_str = match.group(1)
-    end_str = match.group(2)
+    start_text, end_text = match.groups()
 
-    if not start_str:
+    try:
+        if start_text == "":
+            # bytes=-500000
+            length = int(end_text)
 
-        if not end_str:
+            if length <= 0:
+                return None
+
+            start = max(0, file_size - length)
+            end = file_size - 1
+
+        else:
+            start = int(start_text)
+
+            if start >= file_size:
+                return None
+
+            if end_text == "":
+                end = file_size - 1
+            else:
+                end = min(int(end_text), file_size - 1)
+
+        if start > end:
             return None
-
-        suffix_length = int(end_str)
-
-        if suffix_length <= 0:
-            return None
-
-        if suffix_length > file_size:
-            suffix_length = file_size
-
-        start = file_size - suffix_length
-        end = file_size - 1
 
         return start, end
 
-    start = int(start_str)
-
-    if start >= file_size:
+    except ValueError:
         return None
 
-    if end_str:
-        end = int(end_str)
-    else:
-        end = file_size - 1
 
-    if end >= file_size:
-        end = file_size - 1
+async def stream_telegram_range(message, start, end):
+    """
+    Stream one byte range directly from the Telegram storage message.
+    """
 
-    if end < start:
-        return None
+    if telethon_client is None:
+        return
 
-    return start, end
-
-
-# ============================================================
-# TELEGRAM RANGE STREAM
-# ============================================================
-
-async def stream_telegram_range(
-    message,
-    start,
-    end
-):
-
-    total_length = end - start + 1
-
-    sent = 0
+    offset = start
+    remaining = end - start + 1
 
     chunk_size = 512 * 1024
 
     async for chunk in telethon_client.iter_download(
         message.media,
-        offset=start,
-        limit=total_length,
-        chunk_size=chunk_size
+        offset=offset,
+        request_size=chunk_size,
     ):
-
         if not chunk:
-            continue
-
-        remaining = total_length - sent
+            break
 
         if len(chunk) > remaining:
             chunk = chunk[:remaining]
 
-        sent += len(chunk)
-
         yield chunk
 
-        if sent >= total_length:
+        remaining -= len(chunk)
+
+        if remaining <= 0:
             break
 
 
 # ============================================================
-# DIRECT VIDEO STREAM
+# DIRECT VIDEO ROUTES
 # ============================================================
 
 async def video_stream(request):
+    raw_id = request.path_params.get("message_id")
 
-    message_id = request.path_params.get(
-        "message_id"
-    )
+    message_id = safe_message_id(raw_id)
 
-    if not message_id:
+    if message_id is None:
         return PlainTextResponse(
-            "Missing message ID",
-            status_code=400
+            "Invalid message ID",
+            status_code=400,
         )
 
-    if message_id == "latest":
+    try:
+        message = await get_storage_video(message_id)
 
-        message = await get_storage_video()
+        info = get_message_file_info(message)
 
-    else:
+        file_size = info["size"]
 
-        try:
-            message_id = int(message_id)
-        except ValueError:
-
+        if not file_size:
             return PlainTextResponse(
-                "Invalid message ID",
-                status_code=400
+                "Video size unavailable",
+                status_code=500,
             )
 
-        try:
+        mime_type = info["mime_type"] or "video/mp4"
 
-            message = await get_storage_video(
-                message_id
+        range_header = request.headers.get("range")
+
+        byte_range = parse_range_header(
+            range_header,
+            file_size,
+        )
+
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Type": mime_type,
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=3600",
+        }
+
+        if byte_range:
+            start, end = byte_range
+            content_length = end - start + 1
+
+            headers["Content-Range"] = (
+                f"bytes {start}-{end}/{file_size}"
+            )
+            headers["Content-Length"] = str(content_length)
+
+            return StreamingResponse(
+                stream_telegram_range(message, start, end),
+                status_code=206,
+                headers=headers,
+                media_type=mime_type,
             )
 
-        except Exception as e:
-
-            return PlainTextResponse(
-                str(e),
-                status_code=404
-            )
-
-    info = get_message_file_info(
-        message
-    )
-
-    file_size = info["size"]
-
-    if not file_size:
-
-        return PlainTextResponse(
-            "Unable to determine video size.",
-            status_code=500
-        )
-
-    range_header = request.headers.get(
-        "range"
-    )
-
-    byte_range = parse_range_header(
-        range_header,
-        file_size
-    )
-
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Type": (
-            info["mime_type"]
-            or "video/mp4"
-        ),
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "no-cache",
-    }
-
-    if byte_range:
-
-        start, end = byte_range
-
-        content_length = end - start + 1
-
-        headers["Content-Range"] = (
-            f"bytes {start}-{end}/{file_size}"
-        )
-
-        headers["Content-Length"] = str(
-            content_length
-        )
+        headers["Content-Length"] = str(file_size)
 
         return StreamingResponse(
-            stream_telegram_range(
-                message,
-                start,
-                end
-            ),
-            status_code=206,
-            headers=headers
+            stream_telegram_range(message, 0, file_size - 1),
+            status_code=200,
+            headers=headers,
+            media_type=mime_type,
         )
 
-    headers["Content-Length"] = str(
-        file_size
-    )
+    except Exception as e:
+        print(f"video_stream error: {e}")
 
-    return StreamingResponse(
-        stream_telegram_range(
-            message,
-            0,
-            file_size - 1
-        ),
-        status_code=200,
-        headers=headers
-    )
-
-
-# ============================================================
-# VIDEO HEAD
-# ============================================================
-
-async def video_head(request):
-
-    message_id = request.path_params.get(
-        "message_id"
-    )
-
-    if not message_id:
-        return Response(
-            status_code=400
+        return PlainTextResponse(
+            f"Video error: {e}",
+            status_code=404,
         )
 
-    if message_id == "latest":
 
+async def video_latest(request):
+    try:
         message = await get_storage_video()
 
-    else:
+        return await video_stream(
+            type(
+                "RequestWrapper",
+                (),
+                {
+                    "path_params": {
+                        "message_id": str(message.id)
+                    },
+                    "headers": request.headers,
+                },
+            )()
+        )
 
-        try:
-            message = await get_storage_video(
-                int(message_id)
+    except Exception as e:
+        return PlainTextResponse(
+            f"Latest video error: {e}",
+            status_code=404,
+        )
+
+
+async def video_head(request):
+    raw_id = request.path_params.get("message_id")
+
+    message_id = safe_message_id(raw_id)
+
+    if message_id is None:
+        return Response(
+            status_code=400,
+            headers={
+                "Access-Control-Allow-Origin": "*"
+            },
+        )
+
+    try:
+        message = await get_storage_video(message_id)
+
+        info = get_message_file_info(message)
+
+        file_size = info["size"] or 0
+        mime_type = info["mime_type"] or "video/mp4"
+
+        return Response(
+            status_code=200,
+            headers={
+                "Content-Length": str(file_size),
+                "Content-Type": mime_type,
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    except Exception as e:
+        return Response(
+            status_code=404,
+            headers={
+                "Access-Control-Allow-Origin": "*"
+            },
+        )
+
+
+# ============================================================
+# HLS STATUS
+# ============================================================
+
+async def hls_status(request):
+    result = []
+
+    try:
+        for name in sorted(os.listdir(HLS_BASE_DIR)):
+            folder = os.path.join(HLS_BASE_DIR, name)
+
+            if not os.path.isdir(folder):
+                continue
+
+            message_id = safe_message_id(name)
+
+            if message_id is None:
+                continue
+
+            playlist = os.path.join(folder, "index.m3u8")
+
+            if not os.path.isfile(playlist):
+                continue
+
+            segments = [
+                f
+                for f in os.listdir(folder)
+                if f.endswith((".ts", ".m4s"))
+            ]
+
+            result.append(
+                {
+                    "message_id": message_id,
+                    "playlist": f"{BASE_URL}/hls/{message_id}/index.m3u8",
+                    "segments": len(segments),
+                }
             )
-        except Exception:
-            return Response(
-                status_code=404
-            )
 
-    info = get_message_file_info(
-        message
-    )
+    except Exception as e:
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": str(e),
+            },
+            status_code=500,
+        )
 
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Type": (
-            info["mime_type"]
-            or "video/mp4"
-        ),
-        "Content-Length": str(
-            info["size"] or 0
-        ),
-        "Access-Control-Allow-Origin": "*",
-    }
-
-    return Response(
-        status_code=200,
-        headers=headers
+    return JSONResponse(
+        {
+            "status": "ok",
+            "hls_count": len(result),
+            "lectures": result,
+        }
     )
 
 
@@ -631,7 +537,6 @@ async def video_head(request):
 # ============================================================
 
 async def health(request):
-
     return JSONResponse(
         {
             "status": "ok",
@@ -641,146 +546,65 @@ async def health(request):
                 and telethon_client.is_connected()
             ),
             "storage_channel": STORAGE_CHANNEL_ID,
-            "last_storage_message_id":
-                LAST_STORAGE_MESSAGE_ID,
+            "last_storage_message_id": LAST_STORAGE_MESSAGE_ID,
         }
     )
 
 
 # ============================================================
-# HLS STATUS
+# TELEGRAM COMMANDS
 # ============================================================
 
-async def hls_status(request):
-
-    playlist = os.path.join(
-        HLS_BASE_DIR,
-        "index.m3u8"
-    )
-
-    if not os.path.exists(playlist):
-
-        return JSONResponse(
-            {
-                "status": "not_ready",
-                "message": "HLS playlist available nahi hai."
-            }
-        )
-
-    segments = [
-        name
-        for name in os.listdir(
-            HLS_BASE_DIR
-        )
-        if name.endswith(".ts")
-    ]
-
-    return JSONResponse(
-        {
-            "status": "ready",
-            "playlist": (
-                f"{BASE_URL}/hls/index.m3u8"
-            ),
-            "segments": len(segments),
-            "size": os.path.getsize(
-                playlist
-            )
-        }
-    )
-
-
-# ============================================================
-# START COMMAND
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-
-        "👋 H3LIUM Lecture Bot\n\n"
-
-        "🎥 Lecture/video bhejo.\n\n"
-
-        "Video Storage Channel mein save hoga.\n\n"
-
-        "📌 Multi-lecture processing:\n"
+        "ðŸŽ¬ H3LIUM Lecture Bot\n\n"
+        "Video bhejo â†’ Storage Channel mein save hoga.\n\n"
+        "Specific lecture process karne ke liye:\n"
         "/process MESSAGE_ID\n\n"
-
         "Example:\n"
-        "/process 123\n\n"
-
-        "Direct video:\n"
-        f"{BASE_URL}/video/123"
+        "/process 11\n\n"
+        "HLS status:\n"
+        "/hlsstatus"
     )
 
 
-# ============================================================
-# FFMPEG CHECK
-# ============================================================
-
-async def check_ffmpeg(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def ffmpeg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-
         result = subprocess.run(
-            [
-                "ffmpeg",
-                "-version"
-            ],
+            ["ffmpeg", "-version"],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=20,
         )
 
-        if result.returncode == 0:
-
-            first_line = (
-                result.stdout.splitlines()[0]
-                if result.stdout
-                else "FFmpeg found"
-            )
-
-            await update.message.reply_text(
-
-                "✅ FFmpeg AVAILABLE\n\n"
-
-                f"{first_line}\n\n"
-
-                "HLS processing ke liye ready hai."
-            )
-
-        else:
-
-            await update.message.reply_text(
-
-                "❌ FFmpeg command mila, "
-                "lekin run nahi hua.\n\n"
-
-                f"{result.stderr[:1000]}"
-            )
-
-    except FileNotFoundError:
+        first_line = (
+            result.stdout.splitlines()[0]
+            if result.stdout
+            else "FFmpeg installed"
+        )
 
         await update.message.reply_text(
-            "❌ FFmpeg AVAILABLE NAHI HAI."
+            f"âœ… FFmpeg available\n\n{first_line}"
         )
 
     except Exception as e:
-
-        print(
-            "FFmpeg check error:",
-            repr(e)
-        )
-
         await update.message.reply_text(
-            f"⚠️ FFmpeg check error:\n\n{repr(e)}"
+            f"âŒ FFmpeg check failed:\n{e}"
         )
+
+
+async def hlsstatus_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    result = await hls_status(None)
+
+    body = getattr(result, "body", b"")
+
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+
+    await update.message.reply_text(body)
 
 
 # ============================================================
@@ -789,582 +613,432 @@ async def check_ffmpeg(
 
 async def process_video(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
+    requested_message_id=None,
 ):
-
     global PROCESSING
-    global LAST_STORAGE_MESSAGE_ID
-    global LAST_VIDEO_NAME
-    global HLS_BASE_DIR
 
     if PROCESSING:
-
         await update.message.reply_text(
-
-            "⏳ Ek lecture already process ho raha hai.\n\n"
-
-            "Pehle current HLS processing complete hone do."
+            "â³ Ek HLS processing already chal rahi hai.\n"
+            "Pehle uske complete hone ka wait karo."
         )
-
         return
-
-    # --------------------------------------------------------
-    # MESSAGE ID READ
-    # --------------------------------------------------------
-
-    requested_message_id = None
-
-    if context.args:
-
-        try:
-
-            requested_message_id = int(
-                context.args[0]
-            )
-
-        except ValueError:
-
-            await update.message.reply_text(
-
-                "❌ Invalid Message ID.\n\n"
-
-                "Use:\n"
-                "/process MESSAGE_ID\n\n"
-
-                "Example:\n"
-                "/process 123"
-            )
-
-            return
 
     PROCESSING = True
 
-    process_dir = None
+    temp_dir = None
 
     try:
-
-        # ----------------------------------------------------
-        # GET SPECIFIC OR LATEST STORAGE VIDEO
-        # ----------------------------------------------------
-
-        if requested_message_id is not None:
-
-            storage_message = (
-                await get_storage_video(
-                    requested_message_id
-                )
-            )
-
-        else:
-
-            storage_message = (
-                await get_storage_video()
-            )
-
-        storage_id = storage_message.id
-
-        LAST_STORAGE_MESSAGE_ID = storage_id
-
-        file_info = get_message_file_info(
-            storage_message
+        storage_message = await get_storage_video(
+            requested_message_id
         )
 
-        LAST_VIDEO_NAME = (
-            file_info["filename"]
-            or "lecture.mp4"
-        )
+        message_id = int(storage_message.id)
 
-        print(
-            "Processing Storage Message ID:",
-            storage_id
-        )
+        info = get_message_file_info(storage_message)
 
-        print(
-            "Processing filename:",
-            LAST_VIDEO_NAME
-        )
-
-        # ----------------------------------------------------
-        # START MESSAGE
-        # ----------------------------------------------------
+        file_name = info["name"] or "lecture.mp4"
 
         await update.message.reply_text(
-
-            "⏳ HLS processing start ho rahi hai...\n\n"
-
-            f"📌 Storage Message ID: {storage_id}\n"
-
-            f"🎥 File: {LAST_VIDEO_NAME}\n\n"
-
-            "1️⃣ Telegram se lecture retrieve\n"
-            "2️⃣ FFmpeg processing\n"
-            "3️⃣ HLS playlist + segments creation\n\n"
-
+            "â³ HLS processing start ho rahi hai...\n\n"
+            f"ðŸ“Œ Storage Message ID: {message_id}\n"
+            f"ðŸŽ¥ File: {file_name}\n\n"
+            "1ï¸âƒ£ Telegram se lecture retrieve\n"
+            "2ï¸âƒ£ FFmpeg processing\n"
+            "3ï¸âƒ£ HLS playlist + segments creation\n\n"
             "Thoda wait karo."
         )
 
         # ----------------------------------------------------
-        # TEMP DIRECTORY
+        # Temporary download directory
         # ----------------------------------------------------
 
-        process_dir = tempfile.mkdtemp(
-            prefix="h3lium_hls_",
-            dir="/tmp"
+        temp_dir = tempfile.mkdtemp(
+            prefix=f"h3lium_{message_id}_"
         )
 
-        input_file = os.path.join(
-            process_dir,
-            "input.mp4"
+        input_path = os.path.join(
+            temp_dir,
+            "input.mp4",
         )
 
         output_dir = os.path.join(
-            process_dir,
-            "hls"
+            temp_dir,
+            "hls",
         )
 
-        os.makedirs(
-            output_dir,
-            exist_ok=True
-        )
+        os.makedirs(output_dir, exist_ok=True)
 
         # ----------------------------------------------------
-        # DOWNLOAD FROM TELEGRAM
+        # Download from Telegram Storage Channel
         # ----------------------------------------------------
 
         print(
-            "Downloading Telegram media..."
+            f"Downloading storage message {message_id}..."
         )
 
         downloaded = await telethon_client.download_media(
             storage_message,
-            file=input_file
+            file=input_path,
         )
 
-        if not downloaded:
-
+        if not downloaded or not os.path.isfile(input_path):
             raise RuntimeError(
-                "Telegram lecture download nahi hua."
+                "Telegram video download failed."
             )
-
-        if not os.path.exists(input_file):
-
-            raise RuntimeError(
-                "Downloaded input file nahi mila."
-            )
-
-        input_size = os.path.getsize(
-            input_file
-        )
-
-        if input_size <= 0:
-
-            raise RuntimeError(
-                "Downloaded lecture empty hai."
-            )
-
-        print(
-            "Downloaded size:",
-            input_size,
-            "bytes"
-        )
 
         # ----------------------------------------------------
-        # FFMPEG OUTPUT
+        # FFmpeg
         # ----------------------------------------------------
 
-        playlist = os.path.join(
+        playlist_path = os.path.join(
             output_dir,
-            "index.m3u8"
+            "index.m3u8",
         )
 
         segment_pattern = os.path.join(
             output_dir,
-            "segment_%03d.ts"
+            "segment_%05d.ts",
         )
 
-        ffmpeg_command = [
-
+        ffmpeg_cmd = [
             "ffmpeg",
-
             "-y",
-
             "-i",
-            input_file,
+            input_path,
 
-            # VIDEO
             "-c:v",
             "libx264",
-
-            # AUDIO
-            "-c:a",
-            "aac",
-
-            # SPEED
             "-preset",
             "veryfast",
-
-            # COMPATIBILITY
             "-profile:v",
             "main",
-
             "-pix_fmt",
             "yuv420p",
 
-            # HLS
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+
             "-f",
             "hls",
-
             "-hls_time",
             "6",
-
             "-hls_playlist_type",
             "vod",
-
             "-hls_flags",
             "independent_segments",
 
             "-hls_segment_filename",
             segment_pattern,
 
-            playlist
+            playlist_path,
         ]
 
         print(
-            "Running FFmpeg:"
+            "Running FFmpeg:",
+            " ".join(ffmpeg_cmd),
         )
 
-        print(
-            " ".join(ffmpeg_command)
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
-        result = await asyncio.to_thread(
-
-            subprocess.run,
-
-            ffmpeg_command,
-
-            capture_output=True,
-
-            text=True,
-
-            timeout=900
-        )
-
-        # ----------------------------------------------------
-        # FFMPEG FAILURE
-        # ----------------------------------------------------
-
-        if result.returncode != 0:
-
-            print(
-                "FFmpeg STDERR:",
-                result.stderr[-5000:]
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=900,
             )
+        except asyncio.TimeoutError:
+            process.kill()
 
-            await update.message.reply_text(
-
-                "❌ HLS conversion FAILED.\n\n"
-
-                f"📌 Message ID: {storage_id}\n\n"
-
-                "FFmpeg error ka last part:\n\n"
-
-                f"{result.stderr[-2500:]}"
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # VERIFY PLAYLIST
-        # ----------------------------------------------------
-
-        if not os.path.exists(playlist):
+            try:
+                await process.communicate()
+            except Exception:
+                pass
 
             raise RuntimeError(
-                "FFmpeg complete hua lekin "
-                "index.m3u8 nahi mila."
+                "FFmpeg timeout: 15 minutes exceeded."
             )
 
-        segments = [
-
-            filename
-
-            for filename in os.listdir(
-                output_dir
+        if process.returncode != 0:
+            error_text = (
+                stderr.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+                if stderr
+                else "Unknown FFmpeg error"
             )
 
-            if filename.endswith(".ts")
-        ]
+            print(error_text[-5000:])
 
-        playlist_size = os.path.getsize(
-            playlist
-        )
+            raise RuntimeError(
+                "FFmpeg processing failed.\n\n"
+                + error_text[-3000:]
+            )
+
+        if not os.path.isfile(playlist_path):
+            raise RuntimeError(
+                "FFmpeg finished but index.m3u8 was not created."
+            )
 
         # ----------------------------------------------------
-        # REPLACE CURRENT HLS CACHE
+        # PER-LECTURE HLS DIRECTORY
         # ----------------------------------------------------
 
-        if os.path.exists(
-            HLS_BASE_DIR
-        ):
+        final_dir = hls_dir_for_message(message_id)
 
-            shutil.rmtree(
-                HLS_BASE_DIR,
-                ignore_errors=True
-            )
+        # Remove only this lecture's previous HLS output.
+        # Other lecture folders remain untouched.
+        if os.path.isdir(final_dir):
+            shutil.rmtree(final_dir)
 
         shutil.copytree(
             output_dir,
-            HLS_BASE_DIR
+            final_dir,
         )
 
+        final_playlist = os.path.join(
+            final_dir,
+            "index.m3u8",
+        )
+
+        if not os.path.isfile(final_playlist):
+            raise RuntimeError(
+                "Final HLS playlist copy failed."
+            )
+
         # ----------------------------------------------------
-        # SUCCESS
+        # Stats
         # ----------------------------------------------------
 
+        segment_count = len(
+            [
+                name
+                for name in os.listdir(final_dir)
+                if name.endswith(".ts")
+            ]
+        )
+
+        playlist_size = os.path.getsize(
+            final_playlist
+        )
+
         direct_url = (
-            f"{BASE_URL}/video/{storage_id}"
+            f"{BASE_URL}/video/{message_id}"
         )
 
         hls_url = (
-            f"{BASE_URL}/hls/index.m3u8"
+            f"{BASE_URL}/hls/"
+            f"{message_id}/index.m3u8"
         )
 
+        # ----------------------------------------------------
+        # Success
+        # ----------------------------------------------------
+
         await update.message.reply_text(
-
-            "🎉 HLS CONVERSION SUCCESSFUL!\n\n"
-
-            f"📌 Storage Message ID: {storage_id}\n"
-
-            f"🎥 File: {LAST_VIDEO_NAME}\n\n"
-
-            f"🧩 Segments: {len(segments)}\n"
-
-            f"📄 Playlist size: {playlist_size} bytes\n\n"
-
-            "🎬 Direct Video URL:\n"
+            "ðŸŽ‰ HLS CONVERSION SUCCESSFUL!\n\n"
+            f"ðŸ“Œ Storage Message ID: {message_id}\n"
+            f"ðŸŽ¥ File: {file_name}\n\n"
+            f"ðŸ§© Segments: {segment_count}\n"
+            f"ðŸ“„ Playlist size: {playlist_size} bytes\n\n"
+            "ðŸŽ¬ Direct Video URL:\n"
             f"{direct_url}\n\n"
-
-            "📺 HLS URL:\n"
+            "ðŸ“º HLS URL:\n"
             f"{hls_url}"
         )
 
-        print(
-            "HLS SUCCESS for message:",
-            storage_id
-        )
-
-        print(
-            "Segments:",
-            len(segments)
-        )
+        # Also notify the storage channel with the lecture-specific URL.
+        try:
+            await context.bot.send_message(
+                chat_id=STORAGE_CHANNEL_ID,
+                text=(
+                    "ðŸŽ‰ HLS CONVERSION SUCCESSFUL!\n\n"
+                    f"ðŸ“Œ Storage Message ID: {message_id}\n"
+                    f"ðŸŽ¥ File: {file_name}\n\n"
+                    f"ðŸ§© Segments: {segment_count}\n"
+                    f"ðŸ“„ Playlist size: {playlist_size} bytes\n\n"
+                    "ðŸŽ¬ Direct Video URL:\n"
+                    f"{direct_url}\n\n"
+                    "ðŸ“º HLS URL:\n"
+                    f"{hls_url}"
+                ),
+            )
+        except Exception as notify_error:
+            print(
+                "Storage channel notification failed:",
+                notify_error,
+            )
 
     except Exception as e:
-
         print(
-            "HLS PROCESSING ERROR:",
-            repr(e)
+            f"process_video error: {e}"
         )
 
         await update.message.reply_text(
-
-            "❌ HLS processing mein error aaya.\n\n"
-
-            f"{repr(e)}"
+            "âŒ HLS processing failed.\n\n"
+            f"Error:\n{e}"
         )
 
     finally:
-
         PROCESSING = False
 
-        if process_dir and os.path.exists(
-            process_dir
-        ):
+        if temp_dir and os.path.isdir(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as cleanup_error:
+                print(
+                    "Temp cleanup failed:",
+                    cleanup_error,
+                )
 
-            shutil.rmtree(
-                process_dir,
-                ignore_errors=True
-            )
 
-
-# ============================================================
-# MESSAGE HANDLER
-# ============================================================
-
-async def handle_message(
+async def process_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
+    requested_message_id = None
 
+    if context.args:
+        requested_message_id = safe_message_id(
+            context.args[0]
+        )
+
+        if requested_message_id is None:
+            await update.message.reply_text(
+                "âŒ Invalid Message ID.\n\n"
+                "Example:\n"
+                "/process 11"
+            )
+            return
+
+    await process_video(
+        update,
+        context,
+        requested_message_id,
+    )
+
+
+# ============================================================
+# INCOMING VIDEO HANDLER
+# ============================================================
+
+async def incoming_video_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     global LAST_STORAGE_MESSAGE_ID
     global LAST_VIDEO_NAME
 
     message = update.effective_message
 
-    chat = update.effective_chat
-
-    if not message or not chat:
+    if not message:
         return
 
-    # --------------------------------------------------------
-    # IGNORE STORAGE CHANNEL UPDATES
-    # --------------------------------------------------------
+    # Ignore channel posts. The bot should process videos sent
+    # by the user, not the copies/notifications inside storage.
+    if update.effective_chat:
+        if update.effective_chat.type == ChatType.CHANNEL:
+            return
 
-    if chat.type == ChatType.CHANNEL:
+    video_message = None
 
-        return
+    if message.video:
+        video_message = message
 
-    # --------------------------------------------------------
-    # DETECT VIDEO
-    # --------------------------------------------------------
-
-    is_video = bool(
-        message.video
-    )
-
-    is_video_document = bool(
-
-        message.document
-
-        and message.document.mime_type
-
-        and message.document.mime_type.startswith(
-            "video/"
-        )
-    )
-
-    if not (
-        is_video
-        or is_video_document
-    ):
-
-        return
-
-    # --------------------------------------------------------
-    # STORAGE CONFIG
-    # --------------------------------------------------------
-
-    if not STORAGE_CHANNEL_ID:
-
-        await message.reply_text(
-            "⚠️ Storage channel configure nahi hai."
+    elif message.document:
+        mime_type = (
+            message.document.mime_type or ""
         )
 
+        file_name = (
+            message.document.file_name or ""
+        )
+
+        if (
+            mime_type.startswith("video/")
+            or file_name.lower().endswith(
+                (
+                    ".mp4",
+                    ".mkv",
+                    ".mov",
+                    ".avi",
+                    ".webm",
+                    ".m4v",
+                    ".ts",
+                )
+            )
+        ):
+            video_message = message
+
+    if not video_message:
         return
 
     try:
+        copied = await context.bot.copy_message(
+            chat_id=STORAGE_CHANNEL_ID,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
 
-        # ----------------------------------------------------
-        # FILE NAME
-        # ----------------------------------------------------
+        storage_message_id = int(
+            copied.message_id
+        )
 
-        if message.video:
+        LAST_STORAGE_MESSAGE_ID = storage_message_id
 
+        if video_message.video:
             LAST_VIDEO_NAME = (
-                message.video.file_name
+                video_message.video.file_name
                 or "lecture.mp4"
             )
 
-        elif message.document:
-
+        elif video_message.document:
             LAST_VIDEO_NAME = (
-                message.document.file_name
+                video_message.document.file_name
                 or "lecture.mp4"
             )
-
-        # ----------------------------------------------------
-        # COPY TO STORAGE CHANNEL
-        # ----------------------------------------------------
-
-        print(
-            "Copying lecture to Storage Channel..."
-        )
-
-        copied_message = (
-            await context.bot.copy_message(
-
-                chat_id=STORAGE_CHANNEL_ID,
-
-                from_chat_id=chat.id,
-
-                message_id=message.message_id,
-            )
-        )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # copy_message returns MessageId
-        # ----------------------------------------------------
-
-        storage_message_id = (
-            copied_message.message_id
-        )
-
-        LAST_STORAGE_MESSAGE_ID = (
-            storage_message_id
-        )
-
-        print(
-            "Storage Message ID:",
-            storage_message_id
-        )
-
-        # ----------------------------------------------------
-        # REPLY
-        # ----------------------------------------------------
-
-        direct_url = (
-            f"{BASE_URL}/video/"
-            f"{storage_message_id}"
-        )
 
         await message.reply_text(
-
-            "✅ Lecture successfully "
-            "H3LIUM Storage Channel mein save ho gaya.\n\n"
-
-            f"📌 Message ID: {storage_message_id}\n"
-
-            f"🎥 File: {LAST_VIDEO_NAME}\n\n"
-
-            "🎬 Direct Video URL:\n"
-            f"{direct_url}\n\n"
-
-            "🔥 HLS banane ke liye:\n"
+            "âœ… Video storage channel mein save ho gaya.\n\n"
+            f"ðŸ“Œ Storage Message ID: {storage_message_id}\n"
+            f"ðŸŽ¥ File: {LAST_VIDEO_NAME}\n\n"
+            "Process karne ke liye:\n"
             f"/process {storage_message_id}"
         )
 
     except Exception as e:
-
         print(
-            "Storage error:",
-            repr(e)
+            "Storage copy error:",
+            e,
         )
 
         await message.reply_text(
-
-            "❌ Lecture Storage Channel mein "
-            "save nahi ho paya.\n\n"
-
-            f"Error:\n{repr(e)}"
+            "âŒ Video storage channel mein save nahi ho paya.\n\n"
+            f"Error: {e}"
         )
 
 
 # ============================================================
-# TELEGRAM WEBHOOK
+# WEBHOOK
 # ============================================================
 
-async def telegram_webhook(
-    request
-):
+application = None
 
+
+async def telegram_webhook(request):
     try:
-
         data = await request.json()
 
         update = Update.de_json(
             data,
-            application.bot
+            application.bot,
         )
 
         await application.process_update(
@@ -1378,18 +1052,17 @@ async def telegram_webhook(
         )
 
     except Exception as e:
-
         print(
             "Webhook error:",
-            repr(e)
+            e,
         )
 
         return JSONResponse(
             {
                 "ok": False,
-                "error": str(e)
+                "error": str(e),
             },
-            status_code=500
+            status_code=500,
         )
 
 
@@ -1398,57 +1071,63 @@ async def telegram_webhook(
 # ============================================================
 
 routes = [
-
     Route(
         "/health",
         health,
-        methods=["GET"]
+        methods=["GET"],
     ),
 
     Route(
         "/hls-status",
         hls_status,
-        methods=["GET"]
+        methods=["GET"],
     ),
 
     Route(
         f"/{WEBHOOK_PATH}",
         telegram_webhook,
-        methods=["POST"]
+        methods=["POST"],
+    ),
+
+    Route(
+        "/video/latest",
+        video_latest,
+        methods=["GET"],
     ),
 
     Route(
         "/video/{message_id}",
         video_stream,
-        methods=["GET"]
+        methods=["GET"],
     ),
 
     Route(
         "/video/{message_id}",
         video_head,
-        methods=["HEAD"]
+        methods=["HEAD"],
     ),
 
+    # IMPORTANT:
+    # Each lecture now has its own HLS directory.
+    #
+    # /hls/11/index.m3u8
+    # /hls/12/index.m3u8
+    # etc.
     Mount(
         "/hls",
         app=StaticFiles(
-            directory=HLS_BASE_DIR,
-            check_dir=False
+            directory=HLS_BASE_DIR
         ),
-        name="hls"
+        name="hls",
     ),
 ]
 
 
-# ============================================================
-# STARLETTE APP
-# ============================================================
-
-app = Starlette(
+starlette_app = Starlette(
     routes=routes
 )
 
-app.add_middleware(
+starlette_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
@@ -1457,171 +1136,122 @@ app.add_middleware(
 
 
 # ============================================================
-# TELEGRAM APPLICATION
-# ============================================================
-
-application = (
-    ApplicationBuilder()
-    .token(BOT_TOKEN)
-    .build()
-)
-
-
-application.add_handler(
-    CommandHandler(
-        "start",
-        start
-    )
-)
-
-application.add_handler(
-    CommandHandler(
-        "ffmpeg",
-        check_ffmpeg
-    )
-)
-
-application.add_handler(
-    CommandHandler(
-        "process",
-        process_video
-    )
-)
-
-application.add_handler(
-    MessageHandler(
-        filters.ALL,
-        handle_message
-    )
-)
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 async def main():
+    global application
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable missing."
+        )
 
     if not BASE_URL:
-
         raise RuntimeError(
-            "RENDER_EXTERNAL_URL "
-            "environment variable nahi mila."
+            "RENDER_EXTERNAL_URL environment variable missing."
         )
 
     print(
-        "🚀 H3LIUM Lecture Bot starting..."
+        "Starting H3LIUM Lecture Bot..."
     )
-
-    print(
-        "BASE URL:",
-        BASE_URL
-    )
-
-    print(
-        "Storage Channel:",
-        STORAGE_CHANNEL_ID
-    )
-
-    # --------------------------------------------------------
-    # TELETHON
-    # --------------------------------------------------------
 
     await start_telethon()
 
-    # --------------------------------------------------------
-    # TELEGRAM APPLICATION
-    # --------------------------------------------------------
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "ffmpeg",
+            ffmpeg_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "process",
+            process_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "hlsstatus",
+            hlsstatus_command,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.ALL,
+            incoming_video_handler,
+        )
+    )
 
     await application.initialize()
-
     await application.start()
-
-    # --------------------------------------------------------
-    # WEBHOOK
-    # --------------------------------------------------------
 
     webhook_url = (
         f"{BASE_URL}/{WEBHOOK_PATH}"
     )
 
-    await application.bot.set_webhook(
-        url=webhook_url,
-        drop_pending_updates=True
-    )
-
     print(
-        "Webhook URL:",
-        webhook_url
+        f"Setting Telegram webhook: {webhook_url}"
     )
 
-    # --------------------------------------------------------
-    # UVICORN
-    # --------------------------------------------------------
+    await application.bot.set_webhook(
+        url=webhook_url
+    )
 
     config = uvicorn.Config(
-        app,
+        starlette_app,
         host="0.0.0.0",
         port=PORT,
-        log_level="info"
+        log_level="info",
     )
 
-    server = uvicorn.Server(
-        config
-    )
+    server = uvicorn.Server(config)
 
     try:
-
         await server.serve()
 
     finally:
-
         print(
             "Stopping H3LIUM Lecture Bot..."
         )
 
         try:
+            await application.bot.delete_webhook()
+        except Exception:
+            pass
 
+        try:
             await application.stop()
-
-        except Exception as e:
-
-            print(
-                "Application stop error:",
-                repr(e)
-            )
+        except Exception:
+            pass
 
         try:
-
             await application.shutdown()
+        except Exception:
+            pass
 
-        except Exception as e:
-
-            print(
-                "Application shutdown error:",
-                repr(e)
-            )
-
-        try:
-
-            if telethon_client:
-
+        if telethon_client:
+            try:
                 await telethon_client.disconnect()
+            except Exception:
+                pass
 
-        except Exception as e:
-
-            print(
-                "Telethon disconnect error:",
-                repr(e)
-            )
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
-
-    asyncio.run(
-        main()
-    )
+    asyncio.run(main())
