@@ -77,6 +77,10 @@ HLS_BASE_DIR = Path("/tmp/h3lium_hls")
 # Latest generated HLS lives here
 CURRENT_HLS_DIR = HLS_BASE_DIR / "current"
 
+# StaticFiles ko directory startup se pehle chahiye
+HLS_BASE_DIR.mkdir(parents=True, exist_ok=True)
+CURRENT_HLS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # =========================================================
 # TELETHON VIDEO CHECK
