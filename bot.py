@@ -238,15 +238,13 @@ async def get_storage_video(message_id=None):
         except Exception:
             pass
 
-    # 3. Fallback: scan recent messages
-    async for message in telethon_client.iter_messages(
-        STORAGE_CHANNEL_ID,
-        limit=100,
-    ):
-        if is_telethon_video(message):
-            return message
-
-    raise RuntimeError("No video found in the storage channel.")
+    # 3. No history scan here.
+    # Bot accounts cannot use GetHistoryRequest. Callers should provide an
+    # exact storage message ID for deterministic retrieval.
+    raise RuntimeError(
+        "No storage video ID is available. Please provide the exact "
+        "Storage Message ID."
+    )
 
 
 # ============================================================
@@ -634,45 +632,98 @@ def lecture_direct_url(message_id):
 
 
 async def get_lecture_messages(limit=20):
-    """Return recent video lectures directly from the Telegram Storage Channel."""
+    """
+    Return recent video lectures without using GetHistoryRequest.
+
+    Telegram bot accounts cannot call GetHistoryRequest, so we probe known
+    message IDs directly with get_messages(ids=...).  This works with the
+    same bot session already used by the HLS system.
+
+    The scan range is intentionally bounded.  It starts from the latest
+    known storage message ID and also checks a small bootstrap range so
+    existing early lectures (such as IDs 11/12) can be discovered.
+    """
     if telethon_client is None:
         raise RuntimeError("Telethon is not connected.")
 
-    limit = max(1, min(int(limit), 50))
+    limit = max(1, min(int(limit), 30))
+
+    candidate_ids = set()
+
+    # Latest message IDs observed by this running process.
+    last_id = safe_message_id(LAST_STORAGE_MESSAGE_ID)
+    if last_id is not None:
+        # Scan a recent window ending at the latest known ID.
+        window_start = max(1, last_id - 200)
+        candidate_ids.update(range(window_start, last_id + 1))
+
+    # Small bootstrap range lets the library discover older existing
+    # lectures after the first deployment/restart without using history.
+    candidate_ids.update(range(1, 501))
+
+    if not candidate_ids:
+        return []
+
+    ordered_ids = sorted(candidate_ids, reverse=True)
     lectures = []
 
-    async for message in telethon_client.iter_messages(
-        STORAGE_CHANNEL_ID,
-        limit=limit * 3,
-    ):
-        if not is_telethon_video(message):
+    # Telegram accepts a list of message IDs. Keep batches small to avoid
+    # oversized requests and excessive API load.
+    batch_size = 100
+
+    for offset in range(0, len(ordered_ids), batch_size):
+        batch = ordered_ids[offset:offset + batch_size]
+
+        try:
+            messages = await telethon_client.get_messages(
+                STORAGE_CHANNEL_ID,
+                ids=batch,
+            )
+        except Exception as e:
+            print(f"Lecture ID batch lookup failed: {e}")
             continue
 
-        info = get_message_file_info(message)
-        message_id = int(message.id)
-        playlist = os.path.join(
-            HLS_BASE_DIR,
-            str(message_id),
-            "index.m3u8",
-        )
+        if not isinstance(messages, list):
+            messages = [messages]
 
-        lectures.append(
-            {
-                "id": message_id,
-                "name": info["name"] or "lecture.mp4",
-                "size": info["size"],
-                "mime_type": info["mime_type"] or "video/*",
-                "date": getattr(message, "date", None),
-                "hls_ready": os.path.isfile(playlist),
-                "hls_url": lecture_hls_url(message_id),
-                "direct_url": lecture_direct_url(message_id),
-            }
-        )
+        for message in messages:
+            if not message or not is_telethon_video(message):
+                continue
+
+            info = get_message_file_info(message)
+            message_id = int(message.id)
+
+            playlist = os.path.join(
+                HLS_BASE_DIR,
+                str(message_id),
+                "index.m3u8",
+            )
+
+            lectures.append(
+                {
+                    "id": message_id,
+                    "name": info["name"] or "lecture.mp4",
+                    "size": info["size"],
+                    "mime_type": info["mime_type"] or "video/*",
+                    "date": getattr(message, "date", None),
+                    "hls_ready": os.path.isfile(playlist),
+                    "hls_url": lecture_hls_url(message_id),
+                    "direct_url": lecture_direct_url(message_id),
+                }
+            )
+
+            if len(lectures) >= limit:
+                break
 
         if len(lectures) >= limit:
             break
 
-    return lectures
+    lectures.sort(
+        key=lambda item: item["id"],
+        reverse=True,
+    )
+
+    return lectures[:limit]
 
 
 async def lectures_command(
