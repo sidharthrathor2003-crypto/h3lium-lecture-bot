@@ -1,0 +1,4 @@
+python-telegram-bot>=22,<23
+telethon>=1.42,<2
+starlette>=0.47,<1
+uvicorn[standard]>=0.35,<1
