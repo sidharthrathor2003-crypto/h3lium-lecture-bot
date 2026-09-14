@@ -599,6 +599,202 @@ async def health(request):
     )
 
 
+
+# ============================================================
+# LECTURE MANAGEMENT
+# ============================================================
+
+def human_size(size):
+    """Format a byte count for Telegram messages."""
+    if size is None:
+        return "Unknown"
+
+    try:
+        value = float(size)
+    except (TypeError, ValueError):
+        return "Unknown"
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+    return "Unknown"
+
+
+def lecture_hls_url(message_id):
+    return f"{BASE_URL}/hls/{message_id}/index.m3u8"
+
+
+def lecture_direct_url(message_id):
+    return f"{BASE_URL}/video/{message_id}"
+
+
+async def get_lecture_messages(limit=20):
+    """Return recent video lectures directly from the Telegram Storage Channel."""
+    if telethon_client is None:
+        raise RuntimeError("Telethon is not connected.")
+
+    limit = max(1, min(int(limit), 50))
+    lectures = []
+
+    async for message in telethon_client.iter_messages(
+        STORAGE_CHANNEL_ID,
+        limit=limit * 3,
+    ):
+        if not is_telethon_video(message):
+            continue
+
+        info = get_message_file_info(message)
+        message_id = int(message.id)
+        playlist = os.path.join(
+            HLS_BASE_DIR,
+            str(message_id),
+            "index.m3u8",
+        )
+
+        lectures.append(
+            {
+                "id": message_id,
+                "name": info["name"] or "lecture.mp4",
+                "size": info["size"],
+                "mime_type": info["mime_type"] or "video/*",
+                "date": getattr(message, "date", None),
+                "hls_ready": os.path.isfile(playlist),
+                "hls_url": lecture_hls_url(message_id),
+                "direct_url": lecture_direct_url(message_id),
+            }
+        )
+
+        if len(lectures) >= limit:
+            break
+
+    return lectures
+
+
+async def lectures_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """List recent lectures stored in the Telegram Storage Channel."""
+    try:
+        limit = 15
+
+        if context.args:
+            try:
+                limit = int(context.args[0])
+            except ValueError:
+                await update.message.reply_text(
+                    "âŒ Invalid limit. Example:\n/lectures 10"
+                )
+                return
+
+        limit = max(1, min(limit, 30))
+        lectures = await get_lecture_messages(limit)
+
+        if not lectures:
+            await update.message.reply_text(
+                "ðŸ“š Lecture Library empty hai.\n\n"
+                "Storage Channel mein abhi koi video lecture nahi mila."
+            )
+            return
+
+        lines = [
+            "ðŸ“š H3LIUM LECTURE LIBRARY",
+            "",
+            f"Showing latest {len(lectures)} lecture(s)",
+            "",
+        ]
+
+        for index, lecture in enumerate(lectures, start=1):
+            status = "âœ… HLS READY" if lecture["hls_ready"] else "â³ HLS NOT CACHED"
+            lines.extend(
+                [
+                    f"{index}. ðŸŽ¬ {lecture['name']}",
+                    f"   ðŸ†” Message ID: {lecture['id']}",
+                    f"   ðŸ’¾ Size: {human_size(lecture['size'])}",
+                    f"   ðŸ“º {status}",
+                    "",
+                ]
+            )
+
+        lines.append(
+            "ðŸ“Œ Details ke liye:\n/lecture MESSAGE_ID"
+        )
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        print(f"lectures_command error: {e}")
+        await update.message.reply_text(
+            "âŒ Lecture list load nahi ho paayi.\n\n"
+            f"Error:\n{e}"
+        )
+
+
+async def lecture_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Show complete metadata and playback links for one lecture."""
+    if not context.args:
+        await update.message.reply_text(
+            "âŒ Message ID do.\n\n"
+            "Example:\n/lecture 11"
+        )
+        return
+
+    message_id = safe_message_id(context.args[0])
+
+    if message_id is None:
+        await update.message.reply_text(
+            "âŒ Invalid Message ID.\n\n"
+            "Example:\n/lecture 11"
+        )
+        return
+
+    try:
+        message = await get_storage_video(message_id)
+        info = get_message_file_info(message)
+
+        playlist = hls_playlist_path(message_id)
+        hls_ready = os.path.isfile(playlist)
+        status = "âœ… READY" if hls_ready else "â³ NOT CACHED â€” link open karne par rebuild ho jayega"
+
+        date_value = getattr(message, "date", None)
+        date_text = (
+            date_value.strftime("%d-%m-%Y %H:%M:%S UTC")
+            if date_value
+            else "Unknown"
+        )
+
+        await update.message.reply_text(
+            "ðŸŽ¬ LECTURE DETAILS\n\n"
+            f"ðŸ†” Storage Message ID: {message_id}\n"
+            f"ðŸ“ File: {info['name'] or 'lecture.mp4'}\n"
+            f"ðŸ’¾ Size: {human_size(info['size'])}\n"
+            f"ðŸ“¦ MIME: {info['mime_type'] or 'video/*'}\n"
+            f"ðŸ•’ Uploaded: {date_text}\n"
+            f"ðŸ“º HLS Cache: {status}\n\n"
+            "ðŸ“º HLS URL:\n"
+            f"{lecture_hls_url(message_id)}\n\n"
+            "ðŸŽ¥ Direct Video URL:\n"
+            f"{lecture_direct_url(message_id)}\n\n"
+            "ðŸ’¡ HLS cache delete hone ke baad bhi HLS URL ko dobara open karoge "
+            "to Telegram Storage se lecture rebuild ho sakta hai."
+        )
+
+    except Exception as e:
+        print(f"lecture_command error: {e}")
+        await update.message.reply_text(
+            "âŒ Lecture nahi mila.\n\n"
+            f"Error:\n{e}"
+        )
+
+
 # ============================================================
 # TELEGRAM COMMANDS
 # ============================================================
@@ -614,7 +810,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Example:\n"
         "/process 11\n\n"
         "HLS status:\n"
-        "/hlsstatus"
+        "/hlsstatus\n\n"
+        "Lecture library:\n"
+        "/lectures\n"
+        "/lecture MESSAGE_ID"
     )
 
 
@@ -1200,6 +1399,20 @@ async def main():
         CommandHandler(
             "start",
             start_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "lectures",
+            lectures_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "lecture",
+            lecture_command,
         )
     )
 
