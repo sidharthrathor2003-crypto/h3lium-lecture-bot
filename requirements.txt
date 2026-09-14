@@ -1,4 +1,4 @@
-python-telegram-bot>=22,<23
-telethon>=1.42,<2
-starlette>=0.47,<1
-uvicorn[standard]>=0.35,<1
+python-telegram-bot[webhooks]==22.5
+Telethon==1.42.0
+Starlette==0.48.0
+uvicorn==0.35.0
