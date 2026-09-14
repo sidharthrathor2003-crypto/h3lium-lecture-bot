@@ -1,3 +1,4 @@
 python-telegram-bot[webhooks]==22.5
-Flask==3.1.2
 Telethon==1.42.0
+Starlette==0.48.0
+uvicorn==0.35.0
