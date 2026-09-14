@@ -20,7 +20,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse, Response, FileResponse
 from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
@@ -53,6 +53,9 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 LAST_STORAGE_MESSAGE_ID = None
 LAST_VIDEO_NAME = "lecture.mp4"
 PROCESSING = False
+
+# Prevent two requests from generating the same lecture at the same time.
+HLS_LOCK = asyncio.Lock()
 
 telethon_client = None
 
@@ -476,6 +479,51 @@ async def video_head(request):
         )
 
 
+
+async def hls_playlist_route(request):
+    """
+    Self-healing HLS playlist endpoint.
+
+    If the local playlist was deleted after a Render restart/spin-down,
+    rebuild it from the permanent Telegram Storage Channel copy and then
+    return the newly generated playlist.
+    """
+    raw_id = request.path_params.get("message_id")
+    message_id = safe_message_id(raw_id)
+
+    if message_id is None:
+        return PlainTextResponse("Invalid message ID", status_code=400)
+
+    playlist = hls_playlist_path(message_id)
+
+    try:
+        if not os.path.isfile(playlist):
+            print(f"HLS cache miss for message {message_id}; rebuilding...")
+            await ensure_hls_for_message(message_id)
+
+        if not os.path.isfile(playlist):
+            return PlainTextResponse(
+                "HLS playlist could not be created.",
+                status_code=500,
+            )
+
+        return FileResponse(
+            playlist,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+            },
+        )
+
+    except Exception as e:
+        print(f"hls_playlist_route error: {e}")
+        return PlainTextResponse(
+            f"HLS error: {e}",
+            status_code=500,
+        )
+
+
 # ============================================================
 # HLS STATUS
 # ============================================================
@@ -559,7 +607,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ðŸŽ¬ H3LIUM Lecture Bot\n\n"
         "Video bhejo â†’ Storage Channel mein save hoga.\n\n"
-        "Specific lecture process karne ke liye:\n"
+        "Video upload ke baad HLS automatically banega.\n\n"
+        "Purane lecture ka HLS link dobara open karne par, agar Render ka temporary HLS cache delete ho gaya ho, bot Telegram Storage se us lecture ko automatically rebuild karega.\n\n"
+        "Manual processing bhi available hai:\n"
         "/process MESSAGE_ID\n\n"
         "Example:\n"
         "/process 11\n\n"
@@ -611,239 +661,215 @@ async def hlsstatus_command(
 # PROCESS VIDEO
 # ============================================================
 
+async def ensure_hls_for_message(message_id):
+    """
+    Make sure HLS exists for one Telegram storage message.
+
+    If the Render instance restarted and the local HLS folder is gone,
+    this function downloads the original lecture again from Telegram and
+    rebuilds the HLS files automatically.
+    """
+    global PROCESSING
+
+    message_id = safe_message_id(message_id)
+    if message_id is None:
+        raise RuntimeError("Invalid storage message ID.")
+
+    final_dir = hls_dir_for_message(message_id)
+    final_playlist = os.path.join(final_dir, "index.m3u8")
+
+    # Fast path: HLS is already present on this running instance.
+    if os.path.isfile(final_playlist):
+        return {
+            "message_id": message_id,
+            "playlist": final_playlist,
+            "created": False,
+        }
+
+    async with HLS_LOCK:
+        # Another request may have generated it while we were waiting.
+        if os.path.isfile(final_playlist):
+            return {
+                "message_id": message_id,
+                "playlist": final_playlist,
+                "created": False,
+            }
+
+        if PROCESSING:
+            raise RuntimeError(
+                "Another HLS conversion is already running. Please retry in a moment."
+            )
+
+        PROCESSING = True
+        temp_dir = None
+
+        try:
+            storage_message = await get_storage_video(message_id)
+            info = get_message_file_info(storage_message)
+            file_name = info["name"] or "lecture.mp4"
+
+            temp_dir = tempfile.mkdtemp(prefix=f"h3lium_{message_id}_")
+            input_path = os.path.join(temp_dir, "input.mp4")
+            output_dir = os.path.join(temp_dir, "hls")
+            os.makedirs(output_dir, exist_ok=True)
+
+            print(f"Downloading storage message {message_id}...")
+
+            downloaded = await telethon_client.download_media(
+                storage_message,
+                file=input_path,
+            )
+
+            if not downloaded or not os.path.isfile(input_path):
+                raise RuntimeError("Telegram video download failed.")
+
+            playlist_path = os.path.join(output_dir, "index.m3u8")
+            segment_pattern = os.path.join(output_dir, "segment_%05d.ts")
+
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_path,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-profile:v",
+                "main",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-f",
+                "hls",
+                "-hls_time",
+                "6",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_flags",
+                "independent_segments",
+                "-hls_segment_filename",
+                segment_pattern,
+                playlist_path,
+            ]
+
+            print("Running FFmpeg:", " ".join(ffmpeg_cmd))
+
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=900,
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                try:
+                    await process.communicate()
+                except Exception:
+                    pass
+                raise RuntimeError("FFmpeg timeout: 15 minutes exceeded.")
+
+            if process.returncode != 0:
+                error_text = (
+                    stderr.decode("utf-8", errors="replace")
+                    if stderr
+                    else "Unknown FFmpeg error"
+                )
+                print(error_text[-5000:])
+                raise RuntimeError(
+                    "FFmpeg processing failed.\n\n" + error_text[-3000:]
+                )
+
+            if not os.path.isfile(playlist_path):
+                raise RuntimeError(
+                    "FFmpeg finished but index.m3u8 was not created."
+                )
+
+            # Replace only this lecture's HLS directory.
+            if os.path.isdir(final_dir):
+                shutil.rmtree(final_dir)
+
+            shutil.copytree(output_dir, final_dir)
+
+            if not os.path.isfile(final_playlist):
+                raise RuntimeError("Final HLS playlist copy failed.")
+
+            segment_count = len(
+                [
+                    name
+                    for name in os.listdir(final_dir)
+                    if name.endswith(".ts")
+                ]
+            )
+
+            playlist_size = os.path.getsize(final_playlist)
+
+            return {
+                "message_id": message_id,
+                "playlist": final_playlist,
+                "created": True,
+                "file_name": file_name,
+                "segment_count": segment_count,
+                "playlist_size": playlist_size,
+            }
+
+        finally:
+            PROCESSING = False
+            if temp_dir and os.path.isdir(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as cleanup_error:
+                    print("Temp cleanup failed:", cleanup_error)
+
+
 async def process_video(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     requested_message_id=None,
 ):
-    global PROCESSING
-
-    if PROCESSING:
-        await update.message.reply_text(
-            "â³ Ek HLS processing already chal rahi hai.\n"
-            "Pehle uske complete hone ka wait karo."
-        )
-        return
-
-    PROCESSING = True
-
-    temp_dir = None
-
+    """Manual/automatic Telegram command wrapper around HLS generation."""
     try:
-        storage_message = await get_storage_video(
-            requested_message_id
-        )
-
+        storage_message = await get_storage_video(requested_message_id)
         message_id = int(storage_message.id)
-
         info = get_message_file_info(storage_message)
-
         file_name = info["name"] or "lecture.mp4"
 
         await update.message.reply_text(
             "â³ HLS processing start ho rahi hai...\n\n"
             f"ðŸ“Œ Storage Message ID: {message_id}\n"
             f"ðŸŽ¥ File: {file_name}\n\n"
-            "1ï¸âƒ£ Telegram se lecture retrieve\n"
-            "2ï¸âƒ£ FFmpeg processing\n"
-            "3ï¸âƒ£ HLS playlist + segments creation\n\n"
+            "Telegram se lecture retrieve karke FFmpeg HLS banaya ja raha hai.\n"
             "Thoda wait karo."
         )
 
-        # ----------------------------------------------------
-        # Temporary download directory
-        # ----------------------------------------------------
+        result = await ensure_hls_for_message(message_id)
 
-        temp_dir = tempfile.mkdtemp(
-            prefix=f"h3lium_{message_id}_"
-        )
+        hls_url = f"{BASE_URL}/hls/{message_id}/index.m3u8"
+        direct_url = f"{BASE_URL}/video/{message_id}"
 
-        input_path = os.path.join(
-            temp_dir,
-            "input.mp4",
-        )
+        segment_count = result.get("segment_count", 0)
+        playlist_size = result.get("playlist_size", 0)
 
-        output_dir = os.path.join(
-            temp_dir,
-            "hls",
-        )
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        # ----------------------------------------------------
-        # Download from Telegram Storage Channel
-        # ----------------------------------------------------
-
-        print(
-            f"Downloading storage message {message_id}..."
-        )
-
-        downloaded = await telethon_client.download_media(
-            storage_message,
-            file=input_path,
-        )
-
-        if not downloaded or not os.path.isfile(input_path):
-            raise RuntimeError(
-                "Telegram video download failed."
+        if not result.get("created"):
+            segment_count = len(
+                [
+                    name
+                    for name in os.listdir(os.path.dirname(result["playlist"]))
+                    if name.endswith(".ts")
+                ]
             )
-
-        # ----------------------------------------------------
-        # FFmpeg
-        # ----------------------------------------------------
-
-        playlist_path = os.path.join(
-            output_dir,
-            "index.m3u8",
-        )
-
-        segment_pattern = os.path.join(
-            output_dir,
-            "segment_%05d.ts",
-        )
-
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            input_path,
-
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-profile:v",
-            "main",
-            "-pix_fmt",
-            "yuv420p",
-
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-
-            "-f",
-            "hls",
-            "-hls_time",
-            "6",
-            "-hls_playlist_type",
-            "vod",
-            "-hls_flags",
-            "independent_segments",
-
-            "-hls_segment_filename",
-            segment_pattern,
-
-            playlist_path,
-        ]
-
-        print(
-            "Running FFmpeg:",
-            " ".join(ffmpeg_cmd),
-        )
-
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=900,
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-
-            try:
-                await process.communicate()
-            except Exception:
-                pass
-
-            raise RuntimeError(
-                "FFmpeg timeout: 15 minutes exceeded."
-            )
-
-        if process.returncode != 0:
-            error_text = (
-                stderr.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-                if stderr
-                else "Unknown FFmpeg error"
-            )
-
-            print(error_text[-5000:])
-
-            raise RuntimeError(
-                "FFmpeg processing failed.\n\n"
-                + error_text[-3000:]
-            )
-
-        if not os.path.isfile(playlist_path):
-            raise RuntimeError(
-                "FFmpeg finished but index.m3u8 was not created."
-            )
-
-        # ----------------------------------------------------
-        # PER-LECTURE HLS DIRECTORY
-        # ----------------------------------------------------
-
-        final_dir = hls_dir_for_message(message_id)
-
-        # Remove only this lecture's previous HLS output.
-        # Other lecture folders remain untouched.
-        if os.path.isdir(final_dir):
-            shutil.rmtree(final_dir)
-
-        shutil.copytree(
-            output_dir,
-            final_dir,
-        )
-
-        final_playlist = os.path.join(
-            final_dir,
-            "index.m3u8",
-        )
-
-        if not os.path.isfile(final_playlist):
-            raise RuntimeError(
-                "Final HLS playlist copy failed."
-            )
-
-        # ----------------------------------------------------
-        # Stats
-        # ----------------------------------------------------
-
-        segment_count = len(
-            [
-                name
-                for name in os.listdir(final_dir)
-                if name.endswith(".ts")
-            ]
-        )
-
-        playlist_size = os.path.getsize(
-            final_playlist
-        )
-
-        direct_url = (
-            f"{BASE_URL}/video/{message_id}"
-        )
-
-        hls_url = (
-            f"{BASE_URL}/hls/"
-            f"{message_id}/index.m3u8"
-        )
-
-        # ----------------------------------------------------
-        # Success
-        # ----------------------------------------------------
+            playlist_size = os.path.getsize(result["playlist"])
 
         await update.message.reply_text(
-            "ðŸŽ‰ HLS CONVERSION SUCCESSFUL!\n\n"
+            "ðŸŽ‰ HLS READY!\n\n"
             f"ðŸ“Œ Storage Message ID: {message_id}\n"
             f"ðŸŽ¥ File: {file_name}\n\n"
             f"ðŸ§© Segments: {segment_count}\n"
@@ -854,12 +880,11 @@ async def process_video(
             f"{hls_url}"
         )
 
-        # Also notify the storage channel with the lecture-specific URL.
         try:
             await context.bot.send_message(
                 chat_id=STORAGE_CHANNEL_ID,
                 text=(
-                    "ðŸŽ‰ HLS CONVERSION SUCCESSFUL!\n\n"
+                    "ðŸŽ‰ HLS READY!\n\n"
                     f"ðŸ“Œ Storage Message ID: {message_id}\n"
                     f"ðŸŽ¥ File: {file_name}\n\n"
                     f"ðŸ§© Segments: {segment_count}\n"
@@ -871,32 +896,14 @@ async def process_video(
                 ),
             )
         except Exception as notify_error:
-            print(
-                "Storage channel notification failed:",
-                notify_error,
-            )
+            print("Storage channel notification failed:", notify_error)
 
     except Exception as e:
-        print(
-            f"process_video error: {e}"
-        )
-
+        print(f"process_video error: {e}")
         await update.message.reply_text(
             "âŒ HLS processing failed.\n\n"
             f"Error:\n{e}"
         )
-
-    finally:
-        PROCESSING = False
-
-        if temp_dir and os.path.isdir(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-            except Exception as cleanup_error:
-                print(
-                    "Temp cleanup failed:",
-                    cleanup_error,
-                )
 
 
 async def process_command(
@@ -1129,11 +1136,15 @@ routes = [
     ),
 
     # IMPORTANT:
-    # Each lecture now has its own HLS directory.
-    #
-    # /hls/11/index.m3u8
-    # /hls/12/index.m3u8
-    # etc.
+    # The playlist route comes BEFORE the static HLS mount.
+    # It can regenerate a missing playlist from Telegram after a Render restart.
+    Route(
+        "/hls/{message_id}/index.m3u8",
+        hls_playlist_route,
+        methods=["GET"],
+    ),
+
+    # Segment files are still served normally from the per-lecture folder.
     Mount(
         "/hls",
         app=StaticFiles(
