@@ -1009,9 +1009,30 @@ async def incoming_video_handler(
             "âœ… Video storage channel mein save ho gaya.\n\n"
             f"ðŸ“Œ Storage Message ID: {storage_message_id}\n"
             f"ðŸŽ¥ File: {LAST_VIDEO_NAME}\n\n"
-            "Process karne ke liye:\n"
-            f"/process {storage_message_id}"
+            "âš™ï¸ HLS conversion automatically start ho rahi hai...\n"
+            "â³ Conversion complete hone par HLS URL mil jayega."
         )
+
+        # Start HLS conversion in the background using the exact
+        # Telegram Storage Channel message ID. This avoids blocking
+        # the webhook request while FFmpeg processes the lecture.
+        try:
+            context.application.create_task(
+                process_video(
+                    update,
+                    context,
+                    storage_message_id,
+                )
+            )
+        except Exception as task_error:
+            print(
+                "Automatic HLS task start failed:",
+                task_error,
+            )
+            await message.reply_text(
+                "âš ï¸ Video save ho gaya, lekin automatic HLS task start nahi ho paya.\n\n"
+                f"Manual command use karo:\n/process {storage_message_id}"
+            )
 
     except Exception as e:
         print(
