@@ -16,7 +16,8 @@ from telegram.ext import (
     filters,
 )
 
-from telethon import TelegramClient, StringSession
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 from starlette.applications import Starlette
 from starlette.responses import (
